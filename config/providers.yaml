@@ -1,0 +1,29 @@
+# LLM Provider 配置
+# 通过修改 active 字段切换默认 Provider
+
+active: anthropic  # anthropic | openai
+
+providers:
+  anthropic:
+    type: anthropic
+    apiKey: ${ANTHROPIC_API_KEY}
+    model: claude-3-5-sonnet-20241022
+    maxTokens: 8192
+    temperature: 0.2
+    baseURL: null  # 默认为官方，生产可指向代理
+    promptCache: true
+
+  openai:
+    type: openai
+    apiKey: ${OPENAI_API_KEY}
+    model: gpt-4o
+    maxTokens: 8192
+    temperature: 0.2
+    baseURL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    promptCache: false
+
+# 流式输出
+streaming: true
+
+# LLM 调用最大重试次数
+maxRetries: 3

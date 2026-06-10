@@ -1,0 +1,104 @@
+# 权限与安全配置
+#
+# deny：硬黑名单，匹配到直接拒绝
+# confirm：高危操作，需要用户输入 y 确认（pipe 模式默认拒绝）
+# allow：白名单优先级最高（不推荐广泛使用）
+#
+# 匹配规则：
+#   - 在命令 token 序列中查找（避免简单 substring 绕过）
+#   - hostWhitelist：若工具参数含 host，host 必须在白名单内
+
+# 默认 deny 列表（覆盖）
+deny:
+  - "rm -rf /"
+  - "rm -rf /*"
+  - "shutdown"
+  - "reboot"
+  - "halt"
+  - "poweroff"
+  - "init 0"
+  - "init 6"
+  - "mkfs"
+  - "dd if="
+  - "fdisk"
+  - "format"
+  - ":(){ :|:& };:"  # fork 炸弹
+  - ">/dev/sda"
+  - "chmod -R 777 /"
+  - "curl * | bash"  # 通过 curl 管道执行（粗略匹配）
+  - "wget * | bash"
+
+# 默认 confirm 列表（高危）
+confirm:
+  - "rm -rf"
+  - "rm -fr"
+  - "chmod -R"
+  - "chown -R"
+  - "iptables -F"
+  - "userdel"
+  - "kill -9 1"
+  - "systemctl stop"
+  - "systemctl disable"
+  - "service * stop"
+  - "DROP TABLE"
+  - "TRUNCATE"
+  - "DELETE FROM"
+  - "kubectl delete namespace"
+  - "docker system prune"
+
+# 主机白名单（可选，留空表示不限制）
+# 支持精确匹配和 CIDR（如 192.168.1.0/24）
+hostWhitelist: []
+  # - 192.168.1.10
+  # - 192.168.1.0/24
+  # - prod-web-*.example.com
+
+# 工具必填字段映射（自研 SshProvider 工具名；与 src/ssh/registry.ts 的 zodSchema 对齐）
+# pattern → 必填字段集合。字段名含 '|' 表示 OR 语义（任一非空即满足）
+requiredFields:
+  ssh_ssh_connect:
+    - host
+    - username
+    - password|privateKey|privateKeyPath
+  ssh_ssh_exec:
+    - connectionId
+    - command
+  ssh_ssh_system_info:
+    - connectionId
+  sftp_ls:
+    - connectionId
+    - path
+  sftp_read:
+    - connectionId
+    - path
+  sftp_write:
+    - connectionId
+    - path
+    - content
+  sftp_mkdir:
+    - connectionId
+    - path
+  sftp_rm:
+    - connectionId
+    - path
+  sftp_mv:
+    - connectionId
+    - source
+    - destination
+  sftp_stat:
+    - connectionId
+    - path
+
+# 允许触发 options menu（多选一菜单）的工具白名单
+# LLM 看到这些工具缺信息时，吐 [OPTIONS:field|opt1=label1,...] 给 REPL 渲染
+optionsMenuTools:
+  - ssh_ssh_connect
+  - ssh_ssh_exec
+  - ssh_ssh_system_info
+
+# 审计日志
+audit:
+  enabled: true
+  path: logs/audit.jsonl
+  # 写入后立即 fsync
+  fsync: true

@@ -1,0 +1,46 @@
+# 工具与 MCP 配置
+
+# 内置本地工具
+localTools:
+  - get_datetime
+  - read_local_file
+  - fetch_url
+
+# 自研 SSH Provider（替换 mcp-server-ssh，避免 MCP transport 冷启动问题）
+sshProvider:
+  maxConnectionsPerHost: 4
+  idleTimeoutMs: 1800000   # 30min
+  connectTimeoutMs: 15000
+  execTimeoutMs: 30000
+  strictHostCheck: false   # 首次信任、缓存指纹
+
+# MCP Server 配置
+# 暂保留 key 兼容历史；s.ssh 已被自研 sshProvider 取代，必须保持 enabled: false
+mcpServers:
+  ssh:
+    enabled: false
+    # stdio 传输：直接通过命令启动 mcp-server-ssh
+    type: stdio
+    command: npx
+    args:
+      - -y
+      - mcp-server-ssh
+    # 传递给 MCP Server 的环境变量
+    env:
+      # MCP Server 自行决定如何连接目标主机
+      SSH_DEFAULT_USER: ${SSH_DEFAULT_USER:-root}
+    # 工具发现缓存 TTL（毫秒），会话内有效
+    toolCacheTtlMs: 600000
+    # 启动超时（毫秒）
+    # 首次冷启动（npx -y 下载 + 校验 + Node 启动 + MCP 初始化）需要 60-120s，
+    # Windows 路径下 AV 扫描会进一步加慢。建议首次使用前手动 warmup：
+    #   npx -y mcp-server-ssh &
+    #   (等待包下载完成，看到 "SSH MCP server running" 后 Ctrl+C)
+    # 之后 npx 缓存命中，启动会回到 3-5s。
+    startupTimeoutMs: 120000
+    # 工具调用超时（毫秒）
+    callTimeoutMs: 120000
+
+# 工具调用并发限制
+concurrency:
+  maxInFlight: 5

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.env.local
+logs/
+sessions/
+!sessions/.gitkeep
+!logs/.gitkeep
+.cache/
+.vscode/
+.idea/

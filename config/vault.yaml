@@ -1,0 +1,27 @@
+# sshops-vault 配置
+
+# 是否启用 vault（false 时回退到旧的 REPL 密码输入）
+enabled: true
+
+# vault 二进制位置（默认 PATH 搜索）
+# 留空则使用 node_modules/.bin/sshops-vault
+binary: ""
+
+# 是否自动启动 vault（true：agent 启动时 spawn 子进程；false：用户手动启）
+autoStart: true
+
+# 重连策略（vault 进程崩溃时）
+reconnect:
+  maxRetries: 3
+  initialDelayMs: 500
+  backoffFactor: 2
+
+# 审计日志
+audit:
+  enabled: true
+  path: ~/.sshops/vault-audit.jsonl
+
+# v2 加固（v1 暂不实现）
+hardening:
+  seccomp: false
+  restrictedToken: false

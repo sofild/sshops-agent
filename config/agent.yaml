@@ -1,0 +1,72 @@
+# Agent 行为配置
+
+# 主循环最大步数（防止死循环）
+maxSteps: 30
+
+# 单次任务整体超时（秒）
+maxDurationSeconds: 600
+
+# 单个工具调用超时（秒）
+toolTimeoutSeconds: 60
+
+# 工具调用重试
+toolRetry:
+  maxAttempts: 3
+  initialDelayMs: 1000
+  backoffFactor: 2
+  maxDelayMs: 8000
+
+# 上下文压缩
+compression:
+  # L1 Snip：tool_result 超过该字节数截断尾部
+  snipMaxBytes: 4096
+  # L2 Microcompact：连续同类型合并的最小条数
+  microcompactMinRun: 3
+  # L3 Context-Collapse：累计工具调用超过该数触发折叠
+  contextCollapseThreshold: 20
+  # L4 Autocompact：上下文使用率超过该比例触发完整重写
+  autocompactRatio: 0.85
+  # L4 摘要使用的模型（默认同 active provider）
+  summarizerModel: null
+
+# 循环检测：连续 N 步动作相同则主动终止
+loopDetectionWindow: 3
+
+# 反幻觉守卫（hallucination guard）
+hallucinationGuard:
+  enabled: true
+  # tool_result 中匹配这些关键词之一 → 视为失败，触发追问
+  failureKeywords:
+    - "No authentication method"
+    - "No connection with id"
+    - "permission denied"
+    - "command not found"
+    - "Host key verification failed"
+    - "No default SSH key found"
+    - "Authentication failed"
+
+# 可选项菜单（多选一）
+optionsMenu:
+  enabled: true
+  # 哪些工具触发时优先用 options menu 而非直接 confirm
+  preferMenuFor:
+    - "host"
+    - "user"
+    - "connectionId"
+  # memory 中的可选数据源（key → "memory:<key>"）
+  dataSources:
+    - "memory:hosts"
+
+# 熔断器
+circuitBreaker:
+  maxConsecutiveErrors: 3
+  cooldownSeconds: 30
+
+# 模型降级链
+fallback:
+  anthropic:
+    - model: "claude-3-5-haiku-20241022"
+      reason: "primary rate limited or 5xx"
+  openai:
+    - model: "gpt-4o-mini"
+      reason: "primary rate limited or 5xx"
