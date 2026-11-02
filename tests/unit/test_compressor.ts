@@ -2,7 +2,13 @@
  * 四级压缩测试
  */
 import { describe, it, expect } from 'vitest';
-import { snipL1, microcompactL2, countToolCalls } from '../../src/agent/compressor.js';
+import {
+  snipL1,
+  microcompactL2,
+  countToolCalls,
+  findSafeCut,
+  isSafeConversationStart,
+} from '../../src/agent/compressor.js';
 import type { Message } from '../../src/llm/types.js';
 import { resetConfigCache } from '../../src/config/loader.js';
 
@@ -74,5 +80,42 @@ describe('countToolCalls', () => {
       },
     ];
     expect(countToolCalls(messages)).toBe(2);
+  });
+});
+
+describe('compaction boundaries', () => {
+  const conversation: Message[] = [
+    { role: 'user', content: 'start' },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 't1', name: 'ssh_ssh_exec', input: { command: 'ls' } }],
+    },
+    {
+      role: 'user',
+      content: [{ type: 'tool_result', toolUseId: 't1', content: 'file-a' }],
+    },
+    { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+  ];
+
+  it('treats tool_result-only user messages as unsafe starts', () => {
+    expect(isSafeConversationStart(conversation[0])).toBe(true);
+    expect(isSafeConversationStart(conversation[1])).toBe(true);
+    expect(isSafeConversationStart(conversation[2])).toBe(false);
+    expect(isSafeConversationStart(conversation[3])).toBe(true);
+  });
+
+  it('moves a requested fold boundary away from a dangling tool_result', () => {
+    // 期望从 index 2 开始，但 index 2 是 tool_result → 后移到 assistant(index 3)
+    expect(findSafeCut(conversation, 2)).toBe(3);
+  });
+
+  it('keeps assistant + tool_result together when the tail ends in a result', () => {
+    const tail: Message[] = [
+      { role: 'user', content: 'start' },
+      conversation[1],
+      conversation[2],
+    ];
+    // 不能从 index 2 开始，否则 tool_result 没有对应的 tool_use
+    expect(findSafeCut(tail, 2)).toBe(1);
   });
 });

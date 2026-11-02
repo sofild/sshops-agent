@@ -5,11 +5,16 @@
  * - L2 Microcompact: 合并连续同类型 tool_result
  * - L3 Context-Collapse: 累计 tool call 超过阈值，触发 LLM 摘要折叠
  * - L4 Autocompact: 上下文使用率 > autocompactRatio 触发完整重写
+ *
+ * 预算口径：上下文窗口（provider.contextWindow），而不是输出上限
+ * maxTokens。折叠只会发生在消息边界上，避免把 assistant.tool_use 与
+ * 对应的 user.tool_result 拆散（Anthropic 会直接拒绝这种历史）。
  */
-import type { Message, ContentBlock } from '../llm/types.js';
+import type { Message, ContentBlock, ToolDefinition } from '../llm/types.js';
 import { getConfig } from '../config/loader.js';
 import { getLLMClient } from '../llm/factory.js';
 import { getLogger } from '../observability/logging.js';
+import { ContextBudget, estimateRequestTokens, normalizeWindow } from './context-budget.js';
 
 const log = getLogger().child({ component: 'compressor' });
 
@@ -95,6 +100,39 @@ export function countToolCalls(messages: Message[]): number {
   return n;
 }
 
+/**
+ * 判断一条消息能否作为“保留历史”的起点。
+ *
+ * tool_result 必须紧跟在 assistant.tool_use 之后；如果压缩后的 tail 从
+ * 一条 tool_result 开始，就会产生没有对应 tool_use 的孤立结果。
+ */
+export function isSafeConversationStart(m: Message): boolean {
+  if (typeof m.content === 'string') {
+    return m.role === 'user' || m.role === 'assistant';
+  }
+  if (m.role === 'assistant') return true;
+  if (m.role !== 'user') return false;
+  return !m.content.some((b) => b.type === 'tool_result');
+}
+
+/**
+ * 从 desiredStart 开始寻找一个安全的折叠边界。
+ * 优先向后找（多折叠一点），找不到再向前找（少折叠一点）。
+ */
+export function findSafeCut(messages: Message[], desiredStart: number): number {
+  const n = messages.length;
+  if (n <= 1) return 0;
+  const desired = Math.min(Math.max(desiredStart, 1), n - 1);
+  for (let i = desired; i < n; i++) {
+    if (isSafeConversationStart(messages[i])) return i;
+  }
+  for (let i = desired - 1; i >= 1; i--) {
+    if (isSafeConversationStart(messages[i])) return i;
+  }
+  // 没有安全边界：调用方应保持原历史，而不是强行从 tool_result 开始
+  return 0;
+}
+
 /** L3：把早期 N 个 tool_call/result 折叠为 LLM 摘要 */
 export async function contextCollapseL3(
   messages: Message[],
@@ -117,8 +155,12 @@ export async function contextCollapseL3(
   }
   if (seen === 0) return { messages, summary: '' };
 
-  const toSummarize = messages.slice(0, Math.max(...foldIdx) + 2);
-  const kept = messages.slice(Math.max(...foldIdx) + 2);
+  // 不能简单取 max(foldIdx)+2：多工具调用的结果可能位于同一 user 消息，
+  // 或 fold 边界落在 tool_result 上。向前/向后找安全边界。
+  const cut = findSafeCut(messages, Math.max(...foldIdx) + 2);
+  if (cut <= 0 || cut >= messages.length) return { messages, summary: '' };
+  const toSummarize = messages.slice(0, cut);
+  const kept = messages.slice(cut);
 
   const summary = await summarize(toSummarize, 'L3 折叠：' + toSummarize.length + ' 条历史消息');
   const summaryMsg: Message = {
@@ -135,8 +177,10 @@ export async function autocompactL4(
   keepLast = 4
 ): Promise<{ messages: Message[]; summary: string }> {
   if (messages.length <= keepLast + 1) return { messages, summary: '' };
-  const head = messages.slice(0, messages.length - keepLast);
-  const tail = messages.slice(messages.length - keepLast);
+  const cut = findSafeCut(messages, messages.length - keepLast);
+  if (cut <= 0 || cut >= messages.length) return { messages, summary: '' };
+  const head = messages.slice(0, cut);
+  const tail = messages.slice(cut);
   const summary = await summarize(head, 'L4 Autocompact');
   const finalSummary =
     summary && summary !== '(empty summary)'
@@ -150,23 +194,54 @@ export async function autocompactL4(
   return { messages: [summaryMsg, ...tail], summary: finalSummary };
 }
 
-/** 判断是否需要触发 L4 */
-export function shouldAutocompact(messages: Message[]): boolean {
+export interface CompressOptions {
+  /** system prompt 也占输入 token，必须纳入预算 */
+  system?: string;
+  /** 工具 schema 也占输入 token，必须纳入预算 */
+  tools?: ToolDefinition[];
+  /** 覆盖上下文窗口（默认取当前 LLM client） */
+  contextWindow?: number;
+  /** 为输出预留的 token（默认取 active provider.maxTokens） */
+  maxOutputTokens?: number;
+  /** 覆盖压缩阈值比例 */
+  compactionRatio?: number;
+}
+
+function defaultMaxOutputTokens(): number {
+  const cfg = getConfig();
+  const active = cfg.providers.active;
+  return cfg.providers.providers[active]?.maxTokens ?? 0;
+}
+
+/**
+ * 判断是否触发完整重写（L4）。
+ *
+ * 口径：
+ *   input(messages + system + tools) >= floor(contextWindow * ratio) - outputReserve
+ * 而不是旧实现的 tokens / maxTokens（把输出上限当上下文窗口）。
+ */
+export function shouldAutocompact(
+  messages: Message[],
+  opts: CompressOptions = {}
+): boolean {
   const cfg = getConfig().agent.compression;
   const llm = getLLMClient();
-  const tokens = llm.countTokens(messages);
-  // 从 active provider 的 maxTokens 动态读取，不再硬编码 8192
-  const active = getConfig().providers.active;
-  const max = cfg.summarizerModel ? 8192 : (getConfig().providers.providers[active]?.maxTokens ?? 8192);
-  return tokens / max > cfg.autocompactRatio;
+  const budget = new ContextBudget({
+    contextWindow: normalizeWindow(opts.contextWindow ?? llm.contextWindow),
+    maxOutputTokens: opts.maxOutputTokens ?? defaultMaxOutputTokens(),
+    compactionRatio: opts.compactionRatio ?? cfg.autocompactRatio,
+  });
+  return budget.shouldCompact(
+    estimateRequestTokens(llm, messages, opts.system, opts.tools)
+  );
 }
 
 async function summarize(messages: Message[], label: string): Promise<string> {
   const llm = getLLMClient();
-  const sysMsg: Message = {
-    role: 'system',
-    content: `你是一个上下文压缩助手。请把以下历史消息压缩为不超过 800 字的中文摘要，保留所有可执行的关键事实（命令、输出码、错误信息、配置值），省略通用寒暄与重复信息。不要捏造任何事实。`,
-  };
+  // 必须通过 ChatOptions.system 传递：Anthropic provider 会过滤 role=system
+  // 的消息（system 走独立参数），旧实现把压缩指令当普通消息，在 Anthropic 上
+  // 会被静默丢弃，摘要质量无法保证。
+  const system = `你是一个上下文压缩助手。请把以下历史消息压缩为不超过 800 字的中文摘要，保留所有可执行的关键事实（命令、输出码、错误信息、配置值），省略通用寒暄与重复信息。不要捏造任何事实。`;
   const userMsg: Message = {
     role: 'user',
     content: messages
@@ -189,7 +264,11 @@ async function summarize(messages: Message[], label: string): Promise<string> {
   };
   let text = '';
   try {
-    for await (const ev of llm.chat([sysMsg, userMsg], { maxTokens: 2000, temperature: 0 })) {
+    for await (const ev of llm.chat([userMsg], {
+      system,
+      maxTokens: 2000,
+      temperature: 0,
+    })) {
       if (ev.type === 'text_delta') text += ev.text;
     }
   } catch (err) {
@@ -211,24 +290,54 @@ export interface CompressResult {
 }
 
 /** 入口：按顺序尝试 L1→L2→L3→L4 */
-export async function compress(messages: Message[]): Promise<CompressResult> {
+export async function compress(
+  messages: Message[],
+  opts: CompressOptions = {}
+): Promise<CompressResult> {
   const cfg = getConfig().agent.compression;
+  let current = messages;
+  let level: CompressResult['level'] = null;
+  let summary: string | undefined;
+
   // L1
-  let r = snipL1(messages);
-  if (r.changed) return { messages: r.messages, level: 'L1' };
-  // L2
-  r = microcompactL2(messages);
-  if (r.changed) return { messages: r.messages, level: 'L2' };
-  // L3：达到折叠阈值
-  const toolCount = countToolCalls(messages);
-  if (toolCount >= cfg.contextCollapseThreshold) {
-    const r3 = await contextCollapseL3(messages, Math.max(1, Math.floor(toolCount / 2)));
-    return { messages: r3.messages, level: 'L3', summary: r3.summary };
+  const l1 = snipL1(current);
+  if (l1.changed) {
+    current = l1.messages;
+    level = 'L1';
   }
-  // L4
-  if (shouldAutocompact(messages)) {
-    const r4 = await autocompactL4(messages);
-    return { messages: r4.messages, level: 'L4', summary: r4.summary };
+
+  // L2（保持协议安全：只在同 toolUseId 的重复块上合并）
+  const l2 = microcompactL2(current);
+  if (l2.changed) {
+    current = l2.messages;
+    level = 'L2';
   }
-  return { messages, level: null };
+
+  const over = () => shouldAutocompact(current, opts);
+
+  // L3：累计工具调用达到阈值，或上下文已超预算
+  const toolCount = countToolCalls(current);
+  if (over() || toolCount >= cfg.contextCollapseThreshold) {
+    const r3 = await contextCollapseL3(
+      current,
+      Math.max(1, Math.floor(toolCount / 2))
+    );
+    if (r3.summary) {
+      current = r3.messages;
+      level = 'L3';
+      summary = r3.summary;
+    }
+  }
+
+  // L4：L3 之后仍超预算，做完整重写
+  if (over()) {
+    const r4 = await autocompactL4(current);
+    if (r4.summary) {
+      current = r4.messages;
+      level = 'L4';
+      summary = r4.summary;
+    }
+  }
+
+  return { messages: current, level, summary };
 }
