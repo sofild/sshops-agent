@@ -304,6 +304,7 @@ REPL 内部每轮 `agentRun` 结束后，agent 会 yield `final_history` 事件�
 | `LLM_API_KEY` | API 密钥 | — |
 | `LLM_BASE_URL` | 自定义 base URL（兼容 LiteLLM / OneAPI / 自建代理） | — |
 | `LLM_MODEL` | 模型名 | — |
+| `LLM_CONTEXT_WINDOW` | 覆盖 active provider 的上下文窗口（token） | `providers.yaml` 的 `contextWindow` |
 | `ANTHROPIC_API_KEY` | （旧）Anthropic API 密钥 | — |
 | `OPENAI_API_KEY` | （旧）OpenAI API 密钥 | — |
 | `OPENAI_BASE_URL` | （旧）OpenAI base URL | `https://api.openai.com/v1` |

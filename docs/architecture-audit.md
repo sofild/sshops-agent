@@ -105,9 +105,9 @@ src/agent/core.ts  ── 约 1270 行主循环（7 个 continue 站点）
 
 | ID | 状态 | 发现 | 证据 | 影响 |
 |----|------|------|------|------|
-| F-06 | 已修复 | 模型降级链是死配置 | `factory.fallbackToNext()` 无调用方；`fallback` 事件从未发出 | README 承诺的降级链不存在，provider 重试耗尽即熔断 |
+| F-06 | 已修复 | 模型降级链是死配置 | `factory.fallbackToNext()` 无调用方；`fallback` 事件从未发出 | README 承诺的降级链不存在，provider 重试耗尽即熔断。现在接线并在每个 run 开始时恢复主模型 |
 | F-07 | 已修复 | 压缩可能拆散 tool_use/tool_result | L3 取 `max(foldIdx)+2`，L4 直接 `slice(-keepLast)` | 恢复/压缩后请求 400，或模型看到孤立工具结果 |
-| F-08 | 已修复 | YAML `${VAR}` 不展开 | `providers.yaml` 的 `${ANTHROPIC_API_KEY}` 被当字面量 | 设置环境变量也不生效；缺 key 时仍是占位符，401 难以定位 |
+| F-08 | 已修复 | YAML `${VAR}` 不展开、未解析 key 静默通过 | `providers.yaml` 的 `${ANTHROPIC_API_KEY}` 被当字面量 | 设置环境变量不生效；缺 key 时报 401 难定位。现在展开占位符，并在 `loadAndValidate` / `getLLMClient` 对未解析 key 直接报 ConfigError |
 | F-09 | 已修复 | README 承诺的 `SSHOPS_MAX_*` 环境变量未实现 | loader 只处理 `LLM_*` / 日志 / profile | 运维无法通过环境变量调整步数、超时 |
 | F-10 | 待办 | 文本标记协议脆弱 | `parseNeedInputMarker` / `parseOptionsMenuMarker` 正则解析自然语言 | 模型可能伪造标记、在代码块里误触发；无法 schema 校验 |
 | F-11 | 待办 | auto-connect 绕过权限与审计 | `resolveConnectionId()` 直接 `connectTool.execute(..., decision: allow)` | alias/IP 自动连接不受 hostWhitelist / confirm / audit 约束 |
@@ -185,9 +185,9 @@ Anthropic 的 *Building effective agents* / *Effective context engineering*、Op
 
 ```text
 npm run typecheck  通过
-npm test           33 个测试文件 / 212 个用例通过
+npm test           33 个测试文件 / 221 个用例通过
 npm run build      通过
-node dist/main.js config validate    config OK
+ANTHROPIC_API_KEY=sk-test node dist/main.js config validate    config OK
 node dist/main.js session list       正常输出
 node dist/main.js -i                 正常启动并显示 15 个工具
 ```

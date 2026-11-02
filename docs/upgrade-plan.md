@@ -133,7 +133,7 @@ type ApprovalDecision =
 | 压缩安全边界（不拆 tool 配对） | 完成 | `findSafeCut` 单测；L3/L4 不产生孤立 tool_result |
 | 模型降级链接线 | 完成 | 错误后发出 `fallback` 事件并完成本轮 |
 | 非交互 vault 注入顺序 | 完成 | CI/pipe 模式可自动注入 keychain 凭证 |
-| 配置 `${VAR}` 展开 + `SSHOPS_MAX_*` | 完成 | 配置单测；环境变量可覆盖；未解析占位符的启动校验留待 P0.2 |
+| 配置 `${VAR}` 展开 + `SSHOPS_MAX_*` / `LLM_CONTEXT_WINDOW` | 完成 | 配置单测；环境变量可覆盖；未解析 active key 在 `loadAndValidate` / `getLLMClient` 报 ConfigError |
 | ESM `require` 修复 | 完成 | 编译产物 `session list` / REPL 正常 |
 | 审计 exit_code 修正 | 完成 | 失败命令审计不再写成 0 |
 | ESLint 9 配置 | 待办 | `npm run lint` 可执行（当前仓库无 `eslint.config.*`） |
