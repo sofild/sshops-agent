@@ -69,8 +69,11 @@ describe('LLM_* env override', () => {
     const r = loadAndValidate();
     expect(r.ok).toBe(true);
     if (r.ok) {
+      // 通用变量只覆盖 active provider；inactive provider 自己的
+      // `${ANTHROPIC_API_KEY}` 占位符仍会按 YAML 引用展开。
+      // 关键是 active openai 没有被 legacy ANTHROPIC_API_KEY 覆盖。
       expect(r.config.providers.providers.openai?.apiKey).toBe('new-key');
-      expect(r.config.providers.providers.anthropic?.apiKey).not.toBe('legacy-key');
+      expect(r.config.providers.providers.anthropic?.apiKey).toBe('legacy-key');
     }
   });
 

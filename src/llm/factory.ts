@@ -24,7 +24,17 @@ export function getLLMClient(): LLMClient {
   if (!provider) {
     throw new ConfigError(`active provider not configured: ${active}`);
   }
-  cached = buildProvider(active, provider.model, provider.apiKey, provider.maxTokens, provider.temperature, provider.baseURL ?? null, cfg.providers.maxRetries);
+  cached = buildProvider(
+    active,
+    provider.model,
+    provider.apiKey,
+    provider.maxTokens,
+    provider.contextWindow,
+    provider.temperature,
+    provider.baseURL ?? null,
+    provider.promptCache,
+    cfg.providers.maxRetries
+  );
   activeProviderName = active;
   // 构建降级链
   fallbackChain = buildFallbackChain(active, cfg);
@@ -37,8 +47,10 @@ function buildProvider(
   model: string,
   apiKey: string,
   maxTokens: number,
+  contextWindow: number,
   temperature: number,
   baseURL: string | null,
+  promptCache: boolean,
   maxRetries: number
 ): LLMClient {
   if (type === 'anthropic') {
@@ -46,9 +58,10 @@ function buildProvider(
       apiKey,
       model,
       maxTokens,
+      contextWindow,
       temperature,
       baseURL,
-      promptCache: true,
+      promptCache,
       maxRetries,
     });
   }
@@ -56,9 +69,10 @@ function buildProvider(
     apiKey,
     model,
     maxTokens,
+    contextWindow,
     temperature,
     baseURL: baseURL ?? 'https://api.openai.com/v1',
-    promptCache: false,
+    promptCache,
     maxRetries,
   });
 }
@@ -76,8 +90,10 @@ function buildFallbackChain(active: 'anthropic' | 'openai', cfg: ReturnType<type
           f.model,
           provider.apiKey,
           provider.maxTokens,
+          provider.contextWindow,
           provider.temperature,
           provider.baseURL ?? null,
+          provider.promptCache,
           cfg.providers.maxRetries
         )
       );

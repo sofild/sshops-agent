@@ -21,6 +21,7 @@ export interface AnthropicProviderOptions {
   apiKey: string;
   model: string;
   maxTokens: number;
+  contextWindow: number;
   temperature: number;
   baseURL?: string | null;
   promptCache: boolean;
@@ -30,12 +31,14 @@ export interface AnthropicProviderOptions {
 export class AnthropicProvider implements LLMClient {
   readonly providerName = 'anthropic';
   readonly defaultModel: string;
+  readonly contextWindow: number;
   private client: Anthropic;
   private opts: AnthropicProviderOptions;
 
   constructor(opts: AnthropicProviderOptions) {
     this.opts = opts;
     this.defaultModel = opts.model;
+    this.contextWindow = opts.contextWindow;
     this.client = new Anthropic({
       apiKey: opts.apiKey,
       baseURL: opts.baseURL ?? undefined,
@@ -92,18 +95,29 @@ export class AnthropicProvider implements LLMClient {
       .filter((m) => m.role !== 'system')
       .map((m) => convertMessage(m, this.opts.promptCache));
 
-    // 工具定义：把 cache_control 放在最末尾的 tool 上以最大化 prompt cache 命中
-    const toolDefs: Anthropic.Tool[] | undefined = options.tools?.map((t, idx, arr) => {
-      const isLast = idx === arr.length - 1;
-      return {
-        name: t.name,
-        description: t.description,
-        input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
-        ...(isLast && this.opts.promptCache
-          ? { cache_control: { type: 'ephemeral' as const } }
-          : {}),
-      };
-    });
+    // 工具定义：把 cache_control 放在最末尾的 tool 上以最大化 prompt cache 命中。
+    // toolChoice=none 时不发送 tools，避免模型仍然产出 tool_use。
+    const exposeTools = options.toolChoice !== 'none';
+    const toolDefs: Anthropic.Tool[] | undefined = exposeTools
+      ? options.tools?.map((t, idx, arr) => {
+          const isLast = idx === arr.length - 1;
+          return {
+            name: t.name,
+            description: t.description,
+            input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
+            ...(isLast && this.opts.promptCache
+              ? { cache_control: { type: 'ephemeral' as const } }
+              : {}),
+          };
+        })
+      : undefined;
+
+    const toolChoice: Anthropic.Messages.ToolChoice | undefined =
+      options.toolChoice === 'auto'
+        ? { type: 'auto' }
+        : options.toolChoice === 'required'
+          ? { type: 'any' }
+          : undefined;
 
     // system prompt 末尾加 cache_control 标记（确保 Anthropic 视为稳定前缀）
     // 旧版 SDK 的 TextBlockParam 类型不一定有 cache_control 字段，断言为 any 解决。
@@ -124,6 +138,7 @@ export class AnthropicProvider implements LLMClient {
       system: systemBlocks,
       messages: converted,
       tools: toolDefs,
+      tool_choice: toolChoice,
       stop_sequences: options.stopSequences,
     });
 
@@ -174,6 +189,7 @@ export class AnthropicProvider implements LLMClient {
           yield {
             type: 'tool_use_end',
             id: currentToolId,
+            name: currentToolName,
             input: parsed,
           };
           currentToolId = '';

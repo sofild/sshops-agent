@@ -14,6 +14,7 @@ import type {
 } from '../types.js';
 import { LLMError, RetryExhaustedError } from '../../utils/errors.js';
 import { getLogger } from '../../observability/logging.js';
+import { convertMessages } from './openai-messages.js';
 
 const log = getLogger().child({ component: 'llm.openai' });
 
@@ -21,6 +22,7 @@ export interface OpenAIProviderOptions {
   apiKey: string;
   model: string;
   maxTokens: number;
+  contextWindow: number;
   temperature: number;
   baseURL: string;
   promptCache: boolean;
@@ -30,12 +32,14 @@ export interface OpenAIProviderOptions {
 export class OpenAICompatibleProvider implements LLMClient {
   readonly providerName = 'openai';
   readonly defaultModel: string;
+  readonly contextWindow: number;
   private client: OpenAI;
   private opts: OpenAIProviderOptions;
 
   constructor(opts: OpenAIProviderOptions) {
     this.opts = opts;
     this.defaultModel = opts.model;
+    this.contextWindow = opts.contextWindow;
     this.client = new OpenAI({
       apiKey: opts.apiKey,
       baseURL: opts.baseURL,
@@ -86,13 +90,10 @@ export class OpenAICompatibleProvider implements LLMClient {
     options: ChatOptions
   ): AsyncIterable<StreamEvent> {
     const oaiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-
     if (options.system) {
       oaiMessages.push({ role: 'system', content: options.system });
     }
-    for (const m of messages) {
-      oaiMessages.push(...convertMessage(m));
-    }
+    oaiMessages.push(...convertMessages(messages));
 
     const tools: OpenAI.Chat.ChatCompletionTool[] | undefined = options.tools?.map((t) => ({
       type: 'function',
@@ -109,6 +110,7 @@ export class OpenAICompatibleProvider implements LLMClient {
       temperature: options.temperature ?? this.opts.temperature,
       messages: oaiMessages,
       tools,
+      tool_choice: options.toolChoice,
       stream: true,
       stream_options: { include_usage: true },
     });
@@ -116,11 +118,17 @@ export class OpenAICompatibleProvider implements LLMClient {
     const messageId = `msg-${Date.now()}`;
     yield { type: 'message_start', messageId };
 
-    // 用于累积工具调用
-    const toolCalls = new Map<number, { id: string; name: string; input: string }>();
+    // 用于累积工具调用。某些 OpenAI 兼容网关会把 id / name / arguments
+    // 拆到不同 chunk，甚至 name 晚于 id 到达，因此这里按 index 累积，
+    // 等 name 可用时再发 tool_use_start。
+    const toolCalls = new Map<
+      number,
+      { id: string; name: string; input: string; started: boolean }
+    >();
 
     for await (const chunk of stream) {
       if (options.signal?.aborted) {
+        (stream as unknown as { controller?: AbortController }).controller?.abort();
         throw new LLMError('aborted', this.providerName);
       }
       const choice = chunk.choices[0];
@@ -131,18 +139,23 @@ export class OpenAICompatibleProvider implements LLMClient {
         for (const tc of choice.delta.tool_calls) {
           const idx = tc.index;
           if (!toolCalls.has(idx)) {
-            toolCalls.set(idx, { id: tc.id ?? `call_${idx}`, name: tc.function?.name ?? '', input: '' });
-            if (tc.id && tc.function?.name) {
-              yield { type: 'tool_use_start', id: tc.id, name: tc.function.name };
-            }
+            toolCalls.set(idx, {
+              id: tc.id ?? `call_${idx}`,
+              name: tc.function?.name ?? '',
+              input: '',
+              started: false,
+            });
           }
           const acc = toolCalls.get(idx)!;
+          if (tc.id) acc.id = tc.id;
+          if (tc.function?.name) acc.name = tc.function.name;
+          if (!acc.started && acc.name) {
+            acc.started = true;
+            yield { type: 'tool_use_start', id: acc.id, name: acc.name };
+          }
           if (tc.function?.arguments) {
             acc.input += tc.function.arguments;
             yield { type: 'tool_use_delta', id: acc.id, inputDelta: tc.function.arguments };
-          }
-          if (tc.function?.name && !acc.name) {
-            acc.name = tc.function.name;
           }
         }
       }
@@ -159,69 +172,20 @@ export class OpenAICompatibleProvider implements LLMClient {
     }
 
     for (const [, tc] of toolCalls) {
+      // 极端情况下 name 始终缺失：仍然发出 start，让上层明确报错而不是
+      // 用一个空工具名去执行。
+      if (!tc.started) {
+        yield { type: 'tool_use_start', id: tc.id, name: tc.name };
+      }
       let parsed: Record<string, unknown> = {};
       try {
         parsed = tc.input ? JSON.parse(tc.input) : {};
       } catch {
         parsed = { _raw: tc.input };
       }
-      yield { type: 'tool_use_end', id: tc.id, input: parsed };
+      yield { type: 'tool_use_end', id: tc.id, name: tc.name, input: parsed };
     }
   }
-}
-
-function convertMessage(m: Message): OpenAI.Chat.ChatCompletionMessageParam[] {
-  if (typeof m.content === 'string') {
-    if (m.role === 'tool') {
-      return [
-        {
-          role: 'tool',
-          tool_call_id: 'unknown',
-          content: m.content,
-        },
-      ];
-    }
-    return [{ role: m.role as 'user' | 'assistant' | 'system', content: m.content }];
-  }
-  // content blocks
-  if (m.role === 'tool') {
-    return m.content
-      .filter((b): b is Extract<typeof b, { type: 'tool_result' }> => b.type === 'tool_result')
-      .map((b) => ({
-        role: 'tool' as const,
-        tool_call_id: b.toolUseId,
-        content: b.content,
-      }));
-  }
-  if (m.role === 'user') {
-    const texts = m.content
-      .filter((b): b is Extract<typeof b, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
-    return [{ role: 'user' as const, content: texts }];
-  }
-  if (m.role === 'assistant') {
-    const toolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[] = [];
-    let text = '';
-    for (const b of m.content) {
-      if (b.type === 'text') text += b.text;
-      else if (b.type === 'tool_use') {
-        toolCalls.push({
-          id: b.id,
-          type: 'function',
-          function: { name: b.name, arguments: JSON.stringify(b.input) },
-        });
-      }
-    }
-    return [
-      {
-        role: 'assistant' as const,
-        content: text || null,
-        tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-      },
-    ];
-  }
-  return [];
 }
 
 function isRetryable(err: unknown): boolean {
