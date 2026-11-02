@@ -26,7 +26,7 @@ import type { Question, MenuOption } from '../agent/types.js';
 import { loadMemoryDataSource } from '../agent/memory.js';
 import { InvalidOptionError } from '../utils/errors.js';
 import { ui } from './ui.js';
-import { bootstrapTools, shutdownTools } from '../tools/bootstrap.js';
+import { bootstrapTools, shutdownTools, listRegisteredTools } from '../tools/bootstrap.js';
 import chalk from 'chalk';
 
 const log = getLogger().child({ component: 'repl' });
@@ -532,8 +532,6 @@ async function printBanner(): Promise<void> {
   let toolsLocal = 0;
   let toolsSsh = 0;
   try {
-    // dynamic import 避免循环
-    const { listRegisteredTools } = require('../tools/bootstrap.js') as typeof import('../tools/bootstrap.js');
     const tools = listRegisteredTools();
     toolCount = tools.length;
     for (const t of tools) {

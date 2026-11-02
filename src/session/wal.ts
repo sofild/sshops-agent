@@ -5,7 +5,7 @@
  * - 启动时可回放
  * - WAL-before-yield：每个事件先 fsync 落盘再返回（由 appendSync 实现）
  */
-import { existsSync, mkdirSync, readFileSync, appendFileSync, openSync, writeSync, fsyncSync, closeSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, appendFileSync, openSync, writeSync, fsyncSync, closeSync, statSync, createReadStream, readdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve, dirname } from 'node:path';
 import { PROJECT_ROOT } from '../config/loader.js';
@@ -158,8 +158,7 @@ export class Session {
 export function listSessions(): { id: string; size: number; mtime: Date }[] {
   if (!existsSync(SESSIONS_DIR)) return [];
   const out: { id: string; size: number; mtime: Date }[] = [];
-  const fs = require('node:fs') as typeof import('node:fs');
-  for (const name of fs.readdirSync(SESSIONS_DIR) as string[]) {
+  for (const name of readdirSync(SESSIONS_DIR) as string[]) {
     if (!name.endsWith('.jsonl')) continue;
     const p = resolve(SESSIONS_DIR, name);
     const s = statSync(p);
