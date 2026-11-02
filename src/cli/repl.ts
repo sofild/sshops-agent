@@ -365,7 +365,6 @@ export async function startRepl(initialSessionId?: string): Promise<void> {
                 'repl',
                 `fallback ${ev.fromModel} → ${ev.toModel} (${ev.reason})`
               );
-              metrics.fallbackEvents.inc({ from: ev.fromModel, to: ev.toModel });
               break;
             case 'final':
               if (ui.spinner.isRunning()) ui.spinner.stop();

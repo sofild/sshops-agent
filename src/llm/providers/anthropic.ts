@@ -32,6 +32,7 @@ export class AnthropicProvider implements LLMClient {
   readonly providerName = 'anthropic';
   readonly defaultModel: string;
   readonly contextWindow: number;
+  readonly maxOutputTokens: number;
   private client: Anthropic;
   private opts: AnthropicProviderOptions;
 
@@ -39,6 +40,7 @@ export class AnthropicProvider implements LLMClient {
     this.opts = opts;
     this.defaultModel = opts.model;
     this.contextWindow = opts.contextWindow;
+    this.maxOutputTokens = opts.maxTokens;
     this.client = new Anthropic({
       apiKey: opts.apiKey,
       baseURL: opts.baseURL ?? undefined,
@@ -64,6 +66,9 @@ export class AnthropicProvider implements LLMClient {
         return;
       } catch (err) {
         lastErr = err;
+        if (options.signal?.aborted) {
+          throw new LLMError('aborted', this.providerName);
+        }
         if (!isRetryable(err) || attempt === maxRetries) {
           if (attempt === maxRetries) {
             throw new RetryExhaustedError(
@@ -113,11 +118,11 @@ export class AnthropicProvider implements LLMClient {
       : undefined;
 
     const toolChoice: Anthropic.Messages.ToolChoice | undefined =
-      options.toolChoice === 'auto'
-        ? { type: 'auto' }
-        : options.toolChoice === 'required'
-          ? { type: 'any' }
-          : undefined;
+      exposeTools && options.toolChoice
+        ? options.toolChoice === 'auto'
+          ? { type: 'auto' }
+          : { type: 'any' }
+        : undefined;
 
     // system prompt 末尾加 cache_control 标记（确保 Anthropic 视为稳定前缀）
     // 旧版 SDK 的 TextBlockParam 类型不一定有 cache_control 字段，断言为 any 解决。

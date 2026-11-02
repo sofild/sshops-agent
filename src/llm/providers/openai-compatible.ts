@@ -33,6 +33,7 @@ export class OpenAICompatibleProvider implements LLMClient {
   readonly providerName = 'openai';
   readonly defaultModel: string;
   readonly contextWindow: number;
+  readonly maxOutputTokens: number;
   private client: OpenAI;
   private opts: OpenAIProviderOptions;
 
@@ -40,6 +41,7 @@ export class OpenAICompatibleProvider implements LLMClient {
     this.opts = opts;
     this.defaultModel = opts.model;
     this.contextWindow = opts.contextWindow;
+    this.maxOutputTokens = opts.maxTokens;
     this.client = new OpenAI({
       apiKey: opts.apiKey,
       baseURL: opts.baseURL,
@@ -65,6 +67,9 @@ export class OpenAICompatibleProvider implements LLMClient {
         return;
       } catch (err) {
         lastErr = err;
+        if (options.signal?.aborted) {
+          throw new LLMError('aborted', this.providerName);
+        }
         if (!isRetryable(err) || attempt === maxRetries) {
           if (attempt === maxRetries) {
             throw new RetryExhaustedError(
@@ -110,10 +115,10 @@ export class OpenAICompatibleProvider implements LLMClient {
       temperature: options.temperature ?? this.opts.temperature,
       messages: oaiMessages,
       tools,
-      tool_choice: options.toolChoice,
+      tool_choice: tools && tools.length > 0 ? options.toolChoice : undefined,
       stream: true,
       stream_options: { include_usage: true },
-    });
+    }, { signal: options.signal });
 
     const messageId = `msg-${Date.now()}`;
     yield { type: 'message_start', messageId };
@@ -128,7 +133,6 @@ export class OpenAICompatibleProvider implements LLMClient {
 
     for await (const chunk of stream) {
       if (options.signal?.aborted) {
-        (stream as unknown as { controller?: AbortController }).controller?.abort();
         throw new LLMError('aborted', this.providerName);
       }
       const choice = chunk.choices[0];

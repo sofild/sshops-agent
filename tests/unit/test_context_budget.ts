@@ -81,6 +81,18 @@ describe('ContextBudget', () => {
     expect(budget.shouldCompact(8000)).toBe(false);
   });
 
+  it('clamps an oversized output reserve so compaction does not fire every step', () => {
+    const budget = new ContextBudget({
+      contextWindow: 1000,
+      maxOutputTokens: 950,
+      compactionRatio: 0.8,
+    });
+    // floor(1000*0.8) - floor(1000/2) = 300
+    expect(budget.promptBudgetTokens).toBe(300);
+    expect(budget.shouldCompact(200)).toBe(false);
+    expect(budget.shouldCompact(300)).toBe(true);
+  });
+
   it('clamps nonsensical ratios to a safe default', () => {
     const budget = new ContextBudget({
       contextWindow: 10000,

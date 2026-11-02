@@ -71,6 +71,45 @@ describe('convertMessages (OpenAI protocol)', () => {
     expect(out[0].role).not.toBe('tool');
   });
 
+  it('synthesizes tool messages for unanswered tool calls before user text', () => {
+    const messages: Message[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'c1', name: 'probe', input: {} },
+          { type: 'tool_use', id: 'c2', name: 'probe', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', toolUseId: 'c1', content: 'only one' }],
+      },
+      { role: 'user', content: '继续' },
+    ];
+
+    const out = convertMessages(messages);
+    expect(out.map((m) => m.role)).toEqual(['assistant', 'tool', 'tool', 'user']);
+    expect(out[2]).toMatchObject({
+      role: 'tool',
+      tool_call_id: 'c2',
+    });
+    expect(String((out[2] as { content: string }).content)).toContain(
+      'no tool result recorded'
+    );
+    expect(out[3]).toEqual({ role: 'user', content: '继续' });
+  });
+
+  it('drops empty assistant messages that would be invalid for OpenAI', () => {
+    const messages: Message[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const out = convertMessages(messages);
+    expect(out).toHaveLength(2);
+    expect(out[1]).toMatchObject({ role: 'assistant', content: 'hello' });
+  });
+
   it('handles assistant messages with only tool calls (content=null)', () => {
     const messages: Message[] = [
       {

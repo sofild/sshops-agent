@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   expandEnvPlaceholders,
   getConfig,
+  loadAndValidate,
   resetConfigCache,
 } from '../../src/config/loader.js';
 
@@ -21,6 +22,7 @@ const MANAGED_ENV = [
   'LLM_API_KEY',
   'LLM_BASE_URL',
   'LLM_MODEL',
+  'LLM_CONTEXT_WINDOW',
   'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
@@ -95,6 +97,23 @@ describe('SSHOPS_* agent overrides', () => {
     const cfg = getConfig();
     expect(Number.isFinite(cfg.agent.maxSteps)).toBe(true);
     expect(cfg.agent.maxSteps).toBeGreaterThan(0);
+  });
+
+  it('allows LLM_CONTEXT_WINDOW to override custom endpoints', () => {
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.LLM_API_KEY = 'sk-test';
+    process.env.LLM_CONTEXT_WINDOW = '8192';
+    resetConfigCache();
+
+    const cfg = getConfig();
+    expect(cfg.providers.providers.openai?.contextWindow).toBe(8192);
+  });
+
+  it('reports an unresolved active-provider key instead of pretending config is valid', () => {
+    resetConfigCache();
+    const r = loadAndValidate();
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('unresolved');
   });
 
   it('loads provider contextWindow from YAML (not output maxTokens)', () => {

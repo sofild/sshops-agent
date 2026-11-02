@@ -104,6 +104,8 @@ export interface LLMClient {
    * 不能用 maxTokens（输出上限）冒充。
    */
   readonly contextWindow: number;
+  /** 本 client 的单次输出上限（用于上下文预算预留） */
+  readonly maxOutputTokens?: number;
   /** 流式 chat */
   chat(messages: Message[], options?: ChatOptions): AsyncIterable<StreamEvent>;
   /** 估算 token 数（粗略字符/4 估算，避免依赖具体分词器） */

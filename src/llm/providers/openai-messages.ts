@@ -17,6 +17,10 @@ import type { Message, ContentBlock } from '../types.js';
 
 export type OpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam;
 
+/** 中断/崩溃的 run 可能只留下部分 tool_result；补齐后才能构造合法请求。 */
+const MISSING_TOOL_RESULT =
+  '[no tool result recorded; the run was interrupted or the result was lost]';
+
 function asBlocks(content: ContentBlock[] | string): ContentBlock[] {
   if (typeof content === 'string') return [{ type: 'text', text: content }];
   return content;
@@ -46,11 +50,19 @@ function assistantToolCalls(blocks: ContentBlock[]): OpenAI.Chat.ChatCompletionM
   return calls;
 }
 
+function flushPendingToolResults(out: OpenAIMessage[], pending: Set<string>): void {
+  for (const id of pending) {
+    out.push({ role: 'tool', tool_call_id: id, content: MISSING_TOOL_RESULT });
+  }
+  pending.clear();
+}
+
 /**
  * 把内部 provider-neutral 消息转换为 OpenAI Chat Completions 消息。
  *
  * 输出顺序严格为：assistant(tool_calls) → tool × N → 后续 user 文本。
  * 未匹配到 tool_call 的 tool_result 会转成 user 文本，而不是被丢弃。
+ * 有 tool_call 但没有结果的（中断/崩溃恢复）会补一条 synthetic tool 消息。
  */
 export function convertMessages(messages: Message[]): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
@@ -59,20 +71,22 @@ export function convertMessages(messages: Message[]): OpenAIMessage[] {
 
   for (const m of messages) {
     if (m.role === 'system') {
-      pendingToolCalls = new Set();
+      flushPendingToolResults(out, pendingToolCalls);
       out.push({ role: 'system', content: blocksToText(m.content) });
       continue;
     }
 
     if (m.role === 'assistant') {
-      pendingToolCalls = new Set();
+      flushPendingToolResults(out, pendingToolCalls);
       const blocks = asBlocks(m.content);
       const text = blocksToText(m.content);
       const toolCalls = assistantToolCalls(blocks);
+      // 既没有文本也没有工具调用的空 assistant 消息对 OpenAI 非法，直接跳过。
+      if (!text && toolCalls.length === 0) continue;
       for (const call of toolCalls) pendingToolCalls.add(call.id);
       out.push({
         role: 'assistant',
-        content: text || null,
+        content: text || (toolCalls.length > 0 ? null : ''),
         tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       });
       continue;
@@ -82,21 +96,23 @@ export function convertMessages(messages: Message[]): OpenAIMessage[] {
     // 无法构造合法的 tool 消息，降级为 user 文本。
     if (m.role === 'tool') {
       const blocks = asBlocks(m.content);
+      const texts: string[] = [];
       for (const b of blocks) {
         if (b.type === 'tool_result') {
           if (pendingToolCalls.has(b.toolUseId)) {
             out.push({ role: 'tool', tool_call_id: b.toolUseId, content: b.content });
             pendingToolCalls.delete(b.toolUseId);
           } else {
-            out.push({
-              role: 'user',
-              content: `[tool_result ${b.toolUseId}${b.isError ? ' (error)' : ''}] ${b.content}`,
-            });
+            texts.push(
+              `[tool_result ${b.toolUseId}${b.isError ? ' (error)' : ''}] ${b.content}`
+            );
           }
         } else if (b.type === 'text') {
-          out.push({ role: 'user', content: b.text });
+          texts.push(b.text);
         }
       }
+      flushPendingToolResults(out, pendingToolCalls);
+      if (texts.length > 0) out.push({ role: 'user', content: texts.join('\n') });
       continue;
     }
 
@@ -117,13 +133,14 @@ export function convertMessages(messages: Message[]): OpenAIMessage[] {
         }
       }
     }
+    // 先把未匹配的 tool_call 补成 tool 消息，再输出 user 文本；
+    // role=tool 必须紧跟在 assistant.tool_calls 之后。
+    flushPendingToolResults(out, pendingToolCalls);
     if (texts.length > 0) {
       out.push({ role: 'user', content: texts.join('\n') });
-      // 新的 user turn 已经出现；后续若还有旧 tool_result，只能降级为文本，
-      // 不能把 role=tool 消息放到 user 文本之后。
-      pendingToolCalls.clear();
     }
   }
 
+  flushPendingToolResults(out, pendingToolCalls);
   return out;
 }

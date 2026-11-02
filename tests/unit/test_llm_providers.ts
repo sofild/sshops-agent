@@ -41,6 +41,32 @@ describe('LLMFactory', () => {
     expect(c.defaultModel).toMatch(/claude|gpt/);
   });
 
+  it('fails clearly when the active provider key is unresolved', async () => {
+    // beforeEach already deletes keys; active provider is anthropic by default.
+    const { resetConfigCache } = await import('../../src/config/loader.js');
+    const { resetLLMCache, getLLMClient } = await import('../../src/llm/factory.js');
+    resetConfigCache();
+    resetLLMCache();
+    expect(() => getLLMClient()).toThrow(/unresolved/);
+  });
+
+  it('restores the primary model after a fallback (new run)', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-test-fake';
+    const { resetConfigCache } = await import('../../src/config/loader.js');
+    const { resetLLMCache, getLLMClient, fallbackToNext, resetModelFallback } = await import(
+      '../../src/llm/factory.js'
+    );
+    resetConfigCache();
+    resetLLMCache();
+    const primary = getLLMClient();
+    const switched = fallbackToNext('test');
+    expect(switched).not.toBeNull();
+    expect(getLLMClient().defaultModel).not.toBe(primary.defaultModel);
+    resetModelFallback();
+    expect(getLLMClient().defaultModel).toBe(primary.defaultModel);
+    resetLLMCache();
+  });
+
   it('uses LLM_PROVIDER env override', async () => {
     process.env.LLM_PROVIDER = 'openai';
     process.env.LLM_API_KEY = 'sk-test';

@@ -70,9 +70,11 @@ export class ContextBudget {
 
   constructor(opts: ContextBudgetOptions) {
     this.contextWindow = normalizeWindow(opts.contextWindow);
-    this.maxOutputTokens = Math.max(
-      0,
-      Math.min(opts.maxOutputTokens || 0, this.contextWindow)
+    // 输出预留最多占窗口一半：否则窗口很小时 prompt 预算会被压到 1，
+    // 每一步都触发 L4 摘要，既慢又可能丢事实。
+    this.maxOutputTokens = Math.min(
+      Math.max(0, opts.maxOutputTokens || 0),
+      Math.floor(this.contextWindow / 2)
     );
     this.compactionRatio = normalizeRatio(opts.compactionRatio ?? 0.85);
   }

@@ -148,8 +148,18 @@ export async function* run(
   const sessionId = options.sessionId ?? Session.newId();
   const session = Session.open(sessionId);
   const traceId = newTraceId();
-  // let：模型降级链切换后需要指向新的 client（旧代码从未调用 fallbackToNext）
+  // let：模型降级链切换后需要指向新的 client（旧代码从未调用 fallbackToNext）。
+  // 每个 run 开始时恢复主模型：fallback 是模块级状态，不能让它永久污染进程。
   let llm = getLLMClient();
+  try {
+    const factory = await import('../llm/factory.js');
+    if (typeof factory.resetModelFallback === 'function') {
+      factory.resetModelFallback();
+      llm = getLLMClient();
+    }
+  } catch {
+    // 测试或自定义 factory 可能没有该导出；保持当前 client。
+  }
   const registry = getToolRegistry();
   metrics.activeSessions.inc({});
 
@@ -263,7 +273,7 @@ export async function* run(
         system: systemPrompt,
         tools,
         contextWindow: llm.contextWindow,
-        maxOutputTokens: activeProvider?.maxTokens,
+        maxOutputTokens: llm.maxOutputTokens ?? activeProvider?.maxTokens,
       });
       if (comp.level) {
         runState.messages = [...comp.messages];
@@ -573,7 +583,7 @@ export async function* run(
                 type: 'tool_denied',
                 toolUseId: tc.id,
                 name: tc.name,
-                reason: `missing credentials and vault unavailable (${vaultResult.reason})`,
+                reason: `missing required field(s) in non-interactive mode (vault: ${vaultResult.reason})`,
               };
               toolResults.push({
                 toolUseId: tc.id,
@@ -863,10 +873,28 @@ export async function loadHistory(sessionId: string): Promise<Message[]> {
   // 同一轮的多个 tool_result 必须合并到一条 user 消息里；拆成多条
   // 连续 user 消息会破坏 provider 的 tool_use/tool_result 配对语义。
   let pendingResults: ContentBlock[] = [];
+  let pendingToolUses = new Set<string>();
   const flushResults = () => {
     if (pendingResults.length === 0) return;
     messages.push({ role: 'user', content: pendingResults });
     pendingResults = [];
+  };
+  // 崩溃/中断可能让 WAL 只留下部分 tool_result。缺的结果必须补成
+  // tool_result，否则 provider 会拒绝“有 tool_use 但没有对应结果”的历史。
+  const fillMissingResults = () => {
+    for (const id of pendingToolUses) {
+      pendingResults.push({
+        type: 'tool_result',
+        toolUseId: id,
+        content: '[no tool result recorded; the run was interrupted or the result was lost]',
+        isError: true,
+      });
+    }
+    pendingToolUses.clear();
+  };
+  const flushTurn = () => {
+    fillMissingResults();
+    flushResults();
   };
 
   for (const e of events) {
@@ -878,14 +906,20 @@ export async function loadHistory(sessionId: string): Promise<Message[]> {
         content: d.content,
         isError: d.isError,
       });
+      pendingToolUses.delete(d.id);
       continue;
     }
 
-    flushResults();
+    // tool_call / compression / system 事件不产生消息，也不能触发 flush：
+    // 一次工具链的 tool_call → tool_result 会交替出现，按事件 flush 会把
+    // 并行工具的结果拆成多条 user 消息。
+    if (e.type !== 'user_message' && e.type !== 'assistant_message') continue;
+
+    flushTurn();
     if (e.type === 'user_message') {
       const d = e.data as { text: string };
       messages.push({ role: 'user', content: d.text });
-    } else if (e.type === 'assistant_message') {
+    } else {
       const d = e.data as {
         text: string;
         tool_uses: { id: string; name: string; input: Record<string, unknown> }[];
@@ -893,13 +927,15 @@ export async function loadHistory(sessionId: string): Promise<Message[]> {
       };
       const blocks: ContentBlock[] = [];
       if (d.text) blocks.push({ type: 'text', text: d.text });
-      for (const tu of d.tool_uses ?? []) {
+      const toolUses = d.tool_uses ?? [];
+      for (const tu of toolUses) {
         blocks.push({ type: 'tool_use', id: tu.id, name: tu.name, input: tu.input });
       }
       messages.push({ role: 'assistant', content: blocks });
+      pendingToolUses = new Set(toolUses.map((tu) => tu.id));
     }
   }
-  flushResults();
+  flushTurn();
   return messages;
 }
 

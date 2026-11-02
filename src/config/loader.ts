@@ -91,6 +91,9 @@ const AgentFileSchema = z.object({
         z.object({
           model: z.string(),
           reason: z.string().default('primary unavailable'),
+          /** 可选：该 fallback 模型自己的输出上限/上下文窗口 */
+          maxTokens: z.number().int().positive().optional(),
+          contextWindow: z.number().int().positive().optional(),
         })
       )
     )
@@ -204,6 +207,10 @@ export interface AppConfig {
  * 之前 providers.yaml 中的 `${ANTHROPIC_API_KEY}` 会被当作字面量传给 SDK，
  * 缺 key 时表现为难以理解的 401，而不是“配置缺失”。
  */
+export function isUnresolvedPlaceholder(value: string): boolean {
+  return /^\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}$/.test(value);
+}
+
 export function expandEnvPlaceholders(value: unknown): unknown {
   if (typeof value === 'string') {
     return value.replace(
@@ -254,6 +261,7 @@ function applyEnvOverrides(providers: ProvidersFile): ProvidersFile {
   const llmApiKey = process.env.LLM_API_KEY;
   const llmBaseUrl = process.env.LLM_BASE_URL;
   const llmModel = process.env.LLM_MODEL;
+  const llmContextWindow = process.env.LLM_CONTEXT_WINDOW;
 
   // 旧版 provider-specific 变量（向后兼容）
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
@@ -283,6 +291,16 @@ function applyEnvOverrides(providers: ProvidersFile): ProvidersFile {
       providers.providers.anthropic.model = llmModel;
     } else if (providers.active === 'openai' && providers.providers.openai) {
       providers.providers.openai.model = llmModel;
+    }
+  }
+  if (llmContextWindow) {
+    const n = Number(llmContextWindow);
+    if (Number.isFinite(n) && Number.isInteger(n) && n > 0) {
+      if (providers.active === 'anthropic' && providers.providers.anthropic) {
+        providers.providers.anthropic.contextWindow = n;
+      } else if (providers.active === 'openai' && providers.providers.openai) {
+        providers.providers.openai.contextWindow = n;
+      }
     }
   }
 
@@ -353,7 +371,18 @@ export function getConfig(): AppConfig {
 /** 仅用于 config validate 子命令与单元测试 */
 export function loadAndValidate(): { ok: true; config: AppConfig } | { ok: false; error: string } {
   try {
-    return { ok: true, config: getConfig() };
+    const config = getConfig();
+    const active = config.providers.active;
+    const apiKey = config.providers.providers[active]?.apiKey ?? '';
+    if (isUnresolvedPlaceholder(apiKey)) {
+      return {
+        ok: false,
+        error:
+          `provider ${active} apiKey is unresolved (${apiKey}). ` +
+          `Set the referenced environment variable or LLM_API_KEY.`,
+      };
+    }
+    return { ok: true, config };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
