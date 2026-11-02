@@ -356,6 +356,11 @@ Tests fall into two groups:
 5. **Avoid `vault set` in CI.** Use short-lived service accounts and short-lived credentials; rotate more often than in dev.
 6. **Don't commit `.env` / `sessions/` / `logs/`.** `.gitignore` excludes them by default.
 
+## Architecture upgrade docs
+
+- [Architecture audit](./docs/architecture-audit.md) — current state, key defects, gaps against modern agent engineering practices.
+- [Upgrade plan](./docs/upgrade-plan.md) — P0–P4 roadmap, target architecture, acceptance criteria and risks.
+
 ## Roadmap
 
 - [ ] **Vault v2** — seccomp + restrictedToken process isolation (not in v1)

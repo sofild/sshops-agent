@@ -356,6 +356,11 @@ npm run build       # 编译到 dist/
 5. **避免在 CI 跑 vault set**：CI 环境用一次性服务账号 + 短期凭证；定期 rotate 频率比开发环境高。
 6. **不要把 `.env` / `sessions/` / `logs/` 提交进 Git** — `.gitignore` 已默认排除。
 
+## 架构升级文档
+
+- [架构审计](./docs/architecture-audit.md)：现状、关键缺陷、与主流 Agent 工程规范的差距。
+- [升级计划](./docs/upgrade-plan.md)：P0–P4 路线图、目标架构、验收标准与风险。
+
 ## 路线图
 
 - [ ] **Vault v2**：seccomp + restrictedToken 进程隔离（v1 暂未实现）
