@@ -130,7 +130,7 @@ src/agent/core.ts  ── 约 1270 行主循环（7 个 continue 站点）
 | F-23 | 待办 | 同一次工具调用写两条审计（决策 + 执行），且 host/args 可能已被 vault/auto-connect 修改 | `core.ts` 两处 `auditWrite` | 审计语义不清晰，难以做合规报表 |
 | F-24 | 待办 | 大量配置项无消费者 | `providers.streaming`、`agent.maxTurns`、`circuitBreaker.cooldownSeconds`、`optionsMenu.preferMenuFor`、`compression.summarizerModel`、`tools.concurrency.maxInFlight` | 用户以为改配置有效，实际无行为变化 |
 | F-25 | 待办 | 监控缺延迟/成本/上下文指标 | `tracer.ts` 只生成 ID；metrics 无 histogram | 无法回答“慢在哪、贵在哪、压缩是否有效” |
-| F-26 | 待办 | 无端到端评测集 | 190 个单测偏纯函数，缺少“多轮工具调用 + 两 Provider 协议”回归 | F-01 这类错误无法被测试发现 |
+| F-26 | 部分 | 无 scenario 评测集 | 原 190 个单测偏纯函数；本 PR 新增 loop 级 mock 测试，但缺少覆盖双 Provider 的 golden scenario 集 | F-01 这类错误此前无法被发现；后续需要系统化评测 |
 | F-27 | 待办 | 单文件 约 1270 行主循环 | `core.ts` 同时承担 7 类职责 | 任何改动都需理解全部上下文，review/测试成本高 |
 | F-28 | 待办 | 工具结果语义扁平 | 统一 `content: string`，无结构化 `exitCode`/`truncated`/`retryable` | 模型和 UI 都只能猜；截断后无法继续取数 |
 | F-29 | 待办 | `npm run lint` 不可用 | 仓库无 `eslint.config.*`，ESLint 9 直接报错 | CI/贡献者无法执行 README 中的 lint 步骤 |
