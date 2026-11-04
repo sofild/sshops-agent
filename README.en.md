@@ -304,6 +304,7 @@ At the end of each `agentRun`, the REPL receives a `final_history` event contain
 | `LLM_API_KEY` | API key | — |
 | `LLM_BASE_URL` | Custom base URL (LiteLLM / OneAPI / self-hosted) | — |
 | `LLM_MODEL` | Model name | — |
+| `LLM_CONTEXT_WINDOW` | Override the active provider context window (tokens) | `contextWindow` in `providers.yaml` |
 | `ANTHROPIC_API_KEY` | (legacy) Anthropic API key | — |
 | `OPENAI_API_KEY` | (legacy) OpenAI API key | — |
 | `OPENAI_BASE_URL` | (legacy) OpenAI base URL | `https://api.openai.com/v1` |
@@ -355,6 +356,11 @@ Tests fall into two groups:
 4. **Restrict vault.json permissions.** `chmod 600 ~/.sshops/vault.json` (it contains the host manifest and tags, but no passwords).
 5. **Avoid `vault set` in CI.** Use short-lived service accounts and short-lived credentials; rotate more often than in dev.
 6. **Don't commit `.env` / `sessions/` / `logs/`.** `.gitignore` excludes them by default.
+
+## Architecture upgrade docs
+
+- [Architecture audit](./docs/architecture-audit.md) — current state, key defects, gaps against modern agent engineering practices.
+- [Upgrade plan](./docs/upgrade-plan.md) — P0–P4 roadmap, target architecture, acceptance criteria and risks.
 
 ## Roadmap
 

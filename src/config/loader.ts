@@ -25,7 +25,10 @@ const ProviderConfigSchema = z.object({
   type: z.enum(['anthropic', 'openai']),
   apiKey: z.string().min(1, 'apiKey is required'),
   model: z.string().min(1),
+  /** 单次响应允许的最大输出 token（不是上下文窗口） */
   maxTokens: z.number().int().positive().default(8192),
+  /** 上下文窗口大小（输入 + 输出），用于压缩预算；不是输出上限 */
+  contextWindow: z.number().int().positive().default(128000),
   temperature: z.number().min(0).max(2).default(0.2),
   baseURL: z.string().nullable().optional(),
   promptCache: z.boolean().default(false),
@@ -88,6 +91,9 @@ const AgentFileSchema = z.object({
         z.object({
           model: z.string(),
           reason: z.string().default('primary unavailable'),
+          /** 可选：该 fallback 模型自己的输出上限/上下文窗口 */
+          maxTokens: z.number().int().positive().optional(),
+          contextWindow: z.number().int().positive().optional(),
         })
       )
     )
@@ -191,6 +197,43 @@ export interface AppConfig {
 
 /* -------------------- Loader -------------------- */
 
+/**
+ * 递归展开 YAML 字符串中的环境变量占位符。
+ *
+ * 支持：
+ *   - `${VAR}`：变量存在且非空时替换，否则保留原占位符（便于 doctor 诊断）
+ *   - `${VAR:-default}`：变量缺失/为空时使用 default
+ *
+ * 之前 providers.yaml 中的 `${ANTHROPIC_API_KEY}` 会被当作字面量传给 SDK，
+ * 缺 key 时表现为难以理解的 401，而不是“配置缺失”。
+ */
+export function isUnresolvedPlaceholder(value: string): boolean {
+  return /^\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}$/.test(value);
+}
+
+export function expandEnvPlaceholders(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      (match: string, name: string, fallback?: string) => {
+        const env = process.env[name];
+        if (env !== undefined && env !== '') return env;
+        if (fallback !== undefined) return fallback;
+        return match;
+      }
+    );
+  }
+  if (Array.isArray(value)) return value.map((v) => expandEnvPlaceholders(v));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = expandEnvPlaceholders(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 function loadYaml(schema: z.ZodTypeAny, filename: string, defaults?: unknown): unknown {
   const path = resolve(CONFIG_DIR, filename);
   if (!existsSync(path)) {
@@ -201,7 +244,7 @@ function loadYaml(schema: z.ZodTypeAny, filename: string, defaults?: unknown): u
     throw new Error(`config file not found: ${path}`);
   }
   const raw = readFileSync(path, 'utf-8');
-  const parsed = yaml.load(raw);
+  const parsed = expandEnvPlaceholders(yaml.load(raw));
   const result = schema.safeParse(parsed);
   if (!result.success) {
     const issues = result.error.issues
@@ -218,6 +261,7 @@ function applyEnvOverrides(providers: ProvidersFile): ProvidersFile {
   const llmApiKey = process.env.LLM_API_KEY;
   const llmBaseUrl = process.env.LLM_BASE_URL;
   const llmModel = process.env.LLM_MODEL;
+  const llmContextWindow = process.env.LLM_CONTEXT_WINDOW;
 
   // 旧版 provider-specific 变量（向后兼容）
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
@@ -249,6 +293,16 @@ function applyEnvOverrides(providers: ProvidersFile): ProvidersFile {
       providers.providers.openai.model = llmModel;
     }
   }
+  if (llmContextWindow) {
+    const n = Number(llmContextWindow);
+    if (Number.isFinite(n) && Number.isInteger(n) && n > 0) {
+      if (providers.active === 'anthropic' && providers.providers.anthropic) {
+        providers.providers.anthropic.contextWindow = n;
+      } else if (providers.active === 'openai' && providers.providers.openai) {
+        providers.providers.openai.contextWindow = n;
+      }
+    }
+  }
 
   // 2) 旧版 provider-specific 变量（仅在通用变量未设置时生效）
   if (anthropicKey && !llmApiKey && providers.providers.anthropic) {
@@ -263,6 +317,27 @@ function applyEnvOverrides(providers: ProvidersFile): ProvidersFile {
   return providers;
 }
 
+/**
+ * 应用 README 中已经承诺、但此前没有实现的 SSHOPS_* 运行参数覆盖。
+ * 非法值忽略，避免把 `SSHOPS_MAX_STEPS=abc` 变成 NaN 后静默穿透。
+ */
+function applyAgentEnvOverrides(agent: AgentFile): AgentFile {
+  const positiveInt = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : undefined;
+  };
+
+  const maxSteps = positiveInt('SSHOPS_MAX_STEPS');
+  if (maxSteps !== undefined) agent.maxSteps = maxSteps;
+  const maxDuration = positiveInt('SSHOPS_MAX_DURATION_SECONDS');
+  if (maxDuration !== undefined) agent.maxDurationSeconds = maxDuration;
+  const toolTimeout = positiveInt('SSHOPS_TOOL_TIMEOUT_SECONDS');
+  if (toolTimeout !== undefined) agent.toolTimeoutSeconds = toolTimeout;
+  return agent;
+}
+
 let cached: AppConfig | null = null;
 
 export function getConfig(): AppConfig {
@@ -271,7 +346,8 @@ export function getConfig(): AppConfig {
   let providers = loadYaml(ProvidersFileSchema, 'providers.yaml') as ProvidersFile;
   providers = applyEnvOverrides(providers);
 
-  const agent = loadYaml(AgentFileSchema, 'agent.yaml') as AgentFile;
+  let agent = loadYaml(AgentFileSchema, 'agent.yaml') as AgentFile;
+  agent = applyAgentEnvOverrides(agent);
   const permissions = loadYaml(PermissionsFileSchema, 'permissions.yaml') as PermissionsFile;
   const tools = loadYaml(ToolsFileSchema, 'tools.yaml') as ToolsFile;
   const vault = loadYaml(VaultFileSchema, 'vault.yaml', { enabled: false }) as VaultFile;
@@ -295,7 +371,18 @@ export function getConfig(): AppConfig {
 /** 仅用于 config validate 子命令与单元测试 */
 export function loadAndValidate(): { ok: true; config: AppConfig } | { ok: false; error: string } {
   try {
-    return { ok: true, config: getConfig() };
+    const config = getConfig();
+    const active = config.providers.active;
+    const apiKey = config.providers.providers[active]?.apiKey ?? '';
+    if (isUnresolvedPlaceholder(apiKey)) {
+      return {
+        ok: false,
+        error:
+          `provider ${active} apiKey is unresolved (${apiKey}). ` +
+          `Set the referenced environment variable or LLM_API_KEY.`,
+      };
+    }
+    return { ok: true, config };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

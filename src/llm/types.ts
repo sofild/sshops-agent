@@ -47,11 +47,23 @@ export interface ToolDefinition {
   };
 }
 
+/**
+ * 工具选择策略：
+ * - auto：模型自行决定是否调用工具
+ * - none：本轮禁止调用工具（只允许文本回答）
+ * - required：本轮必须调用至少一个工具
+ *
+ * 这是 provider 原生能力，不再依赖 prompt 中的文字约定。
+ */
+export type ToolChoice = 'auto' | 'none' | 'required';
+
 export interface ChatOptions {
   /** 模型覆盖 */
   model?: string;
   /** 工具定义 */
   tools?: ToolDefinition[];
+  /** 工具选择策略（默认 auto） */
+  toolChoice?: ToolChoice;
   /** 最大 token */
   maxTokens?: number;
   /** 温度 */
@@ -71,7 +83,7 @@ export type StreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'tool_use_start'; id: string; name: string }
   | { type: 'tool_use_delta'; id: string; inputDelta: string }
-  | { type: 'tool_use_end'; id: string; input: Record<string, unknown> }
+  | { type: 'tool_use_end'; id: string; name?: string; input: Record<string, unknown> }
   | { type: 'message_end'; stopReason: string }
   | {
       type: 'usage';
@@ -87,6 +99,13 @@ export interface LLMClient {
   readonly providerName: string;
   /** 默认模型 */
   readonly defaultModel: string;
+  /**
+   * 模型上下文窗口（输入 + 输出）。压缩策略必须以此为准；
+   * 不能用 maxTokens（输出上限）冒充。
+   */
+  readonly contextWindow: number;
+  /** 本 client 的单次输出上限（用于上下文预算预留） */
+  readonly maxOutputTokens?: number;
   /** 流式 chat */
   chat(messages: Message[], options?: ChatOptions): AsyncIterable<StreamEvent>;
   /** 估算 token 数（粗略字符/4 估算，避免依赖具体分词器） */

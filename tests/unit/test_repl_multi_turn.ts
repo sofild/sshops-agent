@@ -45,8 +45,11 @@ describe('loadHistory (multi-turn message reconstruction)', () => {
     session.close();
 
     const history = await loadHistory(sid);
-    // 期待：user, assistant(tool_use tc1), user(tool_result tc1), assistant(tool_use tc2)
-    expect(history.length).toBe(4);
+    // 期待：user, assistant(tool_use tc1), user(tool_result tc1),
+    //       assistant(tool_use tc2), user(synthetic tool_result tc2)
+    // 最后一个 tool_use 没有真实结果（模拟中断），loadHistory 会补一条
+    // synthetic tool_result，保证 provider 协议完整。
+    expect(history.length).toBe(5);
     expect(history[0].role).toBe('user');
     expect(history[1].role).toBe('assistant');
     const assistant1 = history[1].content as Array<Record<string, unknown>>;
@@ -57,6 +60,77 @@ describe('loadHistory (multi-turn message reconstruction)', () => {
     expect(history[3].role).toBe('assistant');
     const assistant2 = history[3].content as Array<Record<string, unknown>>;
     expect(assistant2.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 'tc2')).toBe(true);
+    expect(history[4].role).toBe('user');
+    const synthetic = history[4].content as Array<Record<string, unknown>>;
+    expect(synthetic[0]).toMatchObject({
+      type: 'tool_result',
+      toolUseId: 'tc2',
+      isError: true,
+    });
+  });
+
+  it('groups parallel tool results into one user message despite interleaved tool_call events', async () => {
+    const { Session } = await import('../../src/session/wal.js');
+    const { loadHistory } = await import('../../src/agent/core.js');
+    const sid = 'parallel-history-' + Date.now();
+    const session = Session.open(sid);
+    session.append({ type: 'user_message', data: { text: '探测两台机器' } });
+    session.append({
+      type: 'assistant_message',
+      data: {
+        text: '',
+        tool_uses: [
+          { id: 'p1', name: 'ssh_ssh_exec', input: { command: 'uptime' } },
+          { id: 'p2', name: 'ssh_ssh_exec', input: { command: 'df -h' } },
+        ],
+        stopReason: 'tool_use',
+      },
+    });
+    session.append({ type: 'tool_call', data: { id: 'p1', name: 'ssh_ssh_exec', args: {} } });
+    session.append({ type: 'tool_result', data: { id: 'p1', content: 'up', isError: false } });
+    session.append({ type: 'tool_call', data: { id: 'p2', name: 'ssh_ssh_exec', args: {} } });
+    session.append({ type: 'tool_result', data: { id: 'p2', content: 'disk', isError: false } });
+    session.close();
+
+    const history = await loadHistory(sid);
+    expect(history).toHaveLength(3);
+    expect(history[2].role).toBe('user');
+    const blocks = history[2].content as Array<Record<string, unknown>>;
+    const results = blocks.filter((b) => b.type === 'tool_result');
+    expect(results).toHaveLength(2);
+    expect(results.map((b) => b.toolUseId)).toEqual(['p1', 'p2']);
+  });
+
+  it('synthesizes missing tool results for interrupted turns', async () => {
+    const { Session } = await import('../../src/session/wal.js');
+    const { loadHistory } = await import('../../src/agent/core.js');
+    const sid = 'partial-history-' + Date.now();
+    const session = Session.open(sid);
+    session.append({ type: 'user_message', data: { text: '执行两个命令' } });
+    session.append({
+      type: 'assistant_message',
+      data: {
+        text: '',
+        tool_uses: [
+          { id: 'q1', name: 'ssh_ssh_exec', input: { command: 'a' } },
+          { id: 'q2', name: 'ssh_ssh_exec', input: { command: 'b' } },
+        ],
+        stopReason: 'tool_use',
+      },
+    });
+    session.append({ type: 'tool_call', data: { id: 'q1', name: 'ssh_ssh_exec', args: {} } });
+    session.append({ type: 'tool_result', data: { id: 'q1', content: 'ok', isError: false } });
+    // q2 的结果丢失（模拟中断）
+    session.append({ type: 'assistant_message', data: { text: '继续', tool_uses: [], stopReason: 'end_turn' } });
+    session.close();
+
+    const history = await loadHistory(sid);
+    expect(history).toHaveLength(4);
+    const resultBlocks = history[2].content as Array<Record<string, unknown>>;
+    const results = resultBlocks.filter((b) => b.type === 'tool_result');
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ toolUseId: 'q2', isError: true });
+    expect(String(results[1].content)).toContain('no tool result recorded');
   });
 
   it('cleanup', () => {

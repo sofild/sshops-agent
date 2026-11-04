@@ -16,6 +16,7 @@
  */
 import pino, { type Logger, type LoggerOptions } from 'pino';
 import { getConfig } from '../config/loader.js';
+import { ui } from '../cli/ui.js';
 
 let rootLogger: Logger | null = null;
 let replMode = process.env.SSHOPS_REPL === '1';
@@ -37,10 +38,6 @@ export function isReplMode(): boolean {
  * REPL 模式下的 logger wrapper：所有日志都转给 ui.printLog
  */
 function createReplLogger(cfg: ReturnType<typeof getConfig>): Logger {
-  // 动态 import 避免循环依赖（cli/ui.ts 不应反向依赖 logging）
-  // 使用 sync import 也会工作（ui.ts 不依赖 logging.ts）
-  const { ui } = require('../cli/ui.js') as typeof import('../cli/ui.js');
-
   const baseComponent = 'sshops';
 
   // 通用代理：拦截 level + msg 调用

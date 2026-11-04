@@ -304,6 +304,7 @@ REPL 内部每轮 `agentRun` 结束后，agent 会 yield `final_history` 事件�
 | `LLM_API_KEY` | API 密钥 | — |
 | `LLM_BASE_URL` | 自定义 base URL（兼容 LiteLLM / OneAPI / 自建代理） | — |
 | `LLM_MODEL` | 模型名 | — |
+| `LLM_CONTEXT_WINDOW` | 覆盖 active provider 的上下文窗口（token） | `providers.yaml` 的 `contextWindow` |
 | `ANTHROPIC_API_KEY` | （旧）Anthropic API 密钥 | — |
 | `OPENAI_API_KEY` | （旧）OpenAI API 密钥 | — |
 | `OPENAI_BASE_URL` | （旧）OpenAI base URL | `https://api.openai.com/v1` |
@@ -355,6 +356,11 @@ npm run build       # 编译到 dist/
 4. **限制 vault.json 权限**：`chmod 600 ~/.sshops/vault.json`（含主机清单、tags，但不包含密码）。
 5. **避免在 CI 跑 vault set**：CI 环境用一次性服务账号 + 短期凭证；定期 rotate 频率比开发环境高。
 6. **不要把 `.env` / `sessions/` / `logs/` 提交进 Git** — `.gitignore` 已默认排除。
+
+## 架构升级文档
+
+- [架构审计](./docs/architecture-audit.md)：现状、关键缺陷、与主流 Agent 工程规范的差距。
+- [升级计划](./docs/upgrade-plan.md)：P0–P4 路线图、目标架构、验收标准与风险。
 
 ## 路线图
 

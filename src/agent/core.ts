@@ -142,11 +142,24 @@ export async function* run(
   input: string,
   options: AgentRunOptions = {}
 ): AsyncIterable<AgentEvent> {
-  const cfg = getConfig().agent;
+  const appCfg = getConfig();
+  const cfg = appCfg.agent;
+  const activeProvider = appCfg.providers.providers[appCfg.providers.active];
   const sessionId = options.sessionId ?? Session.newId();
   const session = Session.open(sessionId);
   const traceId = newTraceId();
-  const llm = getLLMClient();
+  // let：模型降级链切换后需要指向新的 client（旧代码从未调用 fallbackToNext）。
+  // 每个 run 开始时恢复主模型：fallback 是模块级状态，不能让它永久污染进程。
+  let llm = getLLMClient();
+  try {
+    const factory = await import('../llm/factory.js');
+    if (typeof factory.resetModelFallback === 'function') {
+      factory.resetModelFallback();
+      llm = getLLMClient();
+    }
+  } catch {
+    // 测试或自定义 factory 可能没有该导出；保持当前 client。
+  }
   const registry = getToolRegistry();
   metrics.activeSessions.inc({});
 
@@ -155,14 +168,14 @@ export async function* run(
     status: 'idle',
     messages: [],
     turnNumber: 0,
-    maxTurns: 50,
+    maxTurns: cfg.maxSteps,
     sessionStartedAt: Date.now(),
     sessionTimeoutSeconds: cfg.maxDurationSeconds,
     turnTimeoutSeconds: cfg.toolTimeoutSeconds,
     hasAttemptedReactiveCompact: false,
     pauseRequested: false,
     consecutiveErrors: 0,
-    maxConsecutiveErrors: 3,
+    maxConsecutiveErrors: cfg.circuitBreaker?.maxConsecutiveErrors ?? 3,
     seenToolUseIds: new Set(),
     fallbackIndex: 0,
     // Phase 4: REPL 透传缓存时复用同一引用；否则每轮创建新 Map（仅当轮内有效）
@@ -242,14 +255,6 @@ export async function* run(
       }
       stepCount++;
 
-      // ---------- continue 站点 D: 上下文压缩判定 ----------
-      const comp = await compress(runState.messages);
-      if (comp.level) {
-        runState.messages = [...comp.messages];
-        yield { type: 'compression', level: comp.level, summary: comp.summary };
-        session.append({ type: 'compression', data: { level: comp.level } });
-      }
-
       // ---------- 准备工具定义（稳定前缀） ----------
       const tools: ToolDefinition[] = registry.list().map((t) => ({
         name: t.name,
@@ -257,11 +262,26 @@ export async function* run(
         inputSchema: t.inputSchema,
       }));
       tools.sort((a, b) => a.name.localeCompare(b.name));
-
-      // ---------- continue 站点 E: 调 LLM ----------
       const systemPrompt = [SYSTEM_PROMPT, options.extraSystem ?? '', allMemoryAsContext()]
         .filter(Boolean)
         .join('\n\n');
+
+      // ---------- continue 站点 D: 上下文压缩判定 ----------
+      // 预算必须包含 system prompt 与工具 schema，窗口来自当前 LLM client
+      // （降级后 model 可能不同），而不是 provider.maxTokens。
+      const comp = await compress(runState.messages, {
+        system: systemPrompt,
+        tools,
+        contextWindow: llm.contextWindow,
+        maxOutputTokens: llm.maxOutputTokens ?? activeProvider?.maxTokens,
+      });
+      if (comp.level) {
+        runState.messages = [...comp.messages];
+        yield { type: 'compression', level: comp.level, summary: comp.summary };
+        session.append({ type: 'compression', data: { level: comp.level } });
+      }
+
+      // ---------- continue 站点 E: 调 LLM ----------
       yield { type: 'message_start', role: 'assistant' };
       let assistantText = '';
       const pendingTools: { id: string; name: string; input: Record<string, unknown> }[] = [];
@@ -289,7 +309,11 @@ export async function* run(
           } else if (ev.type === 'tool_use_start') {
             toolNameById.set(ev.id, ev.name);
           } else if (ev.type === 'tool_use_end') {
-            pendingTools.push({ id: ev.id, name: toolNameById.get(ev.id) ?? '', input: ev.input });
+            pendingTools.push({
+              id: ev.id,
+              name: ev.name ?? toolNameById.get(ev.id) ?? '',
+              input: ev.input,
+            });
           } else if (ev.type === 'message_end') {
             stopReason = ev.stopReason;
           } else if (ev.type === 'usage') {
@@ -316,6 +340,36 @@ export async function* run(
           // 重新抛出 abort 错误，让外层 for-await 接收（REPL 区分 abort vs 真实错误）
           throw err instanceof Error ? err : new Error(String(err));
         }
+
+        // 模型降级链：provider 内部重试已耗尽后才走到这里。
+        // factory.fallbackToNext() 在旧代码中从未被调用（配置是死配置）。
+        try {
+          const factory = await import('../llm/factory.js');
+          if (typeof factory.fallbackToNext === 'function') {
+            const next = factory.fallbackToNext('llm_error');
+            if (next) {
+              llm = factory.getLLMClient();
+              runState.consecutiveErrors = 0;
+              runState.fallbackIndex += 1;
+              const reason = err instanceof Error ? err.message : String(err);
+              log.warn(
+                { from: next.from, to: next.to, reason },
+                'llm fallback switched model'
+              );
+              metrics.fallbackEvents.inc({ from: next.from, to: next.to });
+              yield {
+                type: 'fallback',
+                fromModel: next.from,
+                toModel: next.to,
+                reason: reason.slice(0, 200),
+              };
+              continue;
+            }
+          }
+        } catch (fallbackErr) {
+          log.warn({ err: String(fallbackErr) }, 'llm fallback attempt failed');
+        }
+
         runState.consecutiveErrors += 1;
         if (runState.consecutiveErrors >= runState.maxConsecutiveErrors) {
           transitionTo('error', 'circuit_open');
@@ -346,8 +400,12 @@ export async function* run(
       }
 
       // ---------- 解析 LLM 响应中的 need_input / options_menu 结构化标记 ----------
-      const needInputQuestions = parseNeedInputMarker(assistantText);
-      const optionsMenu = parseOptionsMenuMarker(assistantText);
+      // 尊重配置开关：旧实现解析后无条件触发，config 里的 enabled 是死开关。
+      const needInputQuestions =
+        cfg.hallucinationGuard?.enabled !== false ? parseNeedInputMarker(assistantText) : null;
+      const optionsMenu =
+        cfg.optionsMenu?.enabled !== false ? parseOptionsMenuMarker(assistantText) : null;
+      let guardHintNeeded = false;
 
       // 把 assistant 消息加入历史（保留结构化标记以便审计）
       const assistantBlocks: ContentBlock[] = [];
@@ -366,14 +424,11 @@ export async function* run(
         const lastToolId = pendingTools[pendingTools.length - 1]?.id ?? `ask_${Date.now()}`;
         yield { type: 'need_input', toolUseId: lastToolId, questions: needInputQuestions };
         metrics.needInputEvents.inc({ tool: pendingTools[pendingTools.length - 1]?.name ?? 'unknown' });
-        // 反幻觉：强制注入 user 消息要求 LLM 等待用户输入
-        runState.messages = [
-          ...runState.messages,
-          {
-            role: 'user',
-            content: HALLUCINATION_GUARD_HINT,
-          },
-        ];
+        // 反幻觉提示不能插在 assistant.tool_use 与 tool_result 之间：
+        // Anthropic 要求 tool_result 紧跟上一条 assistant 的 tool_use，
+        // OpenAI 要求 tool 消息紧跟 assistant.tool_calls。旧实现把提示
+        // 作为独立 user 消息提前插入，会直接制造非法历史。
+        guardHintNeeded = true;
       }
 
       // 如果 LLM 触发了 options_menu，yield 事件
@@ -482,22 +537,8 @@ export async function* run(
         }
 
         if (decision.decision === 'confirm') {
-          if (options.nonInteractive) {
-            yield {
-              type: 'tool_denied',
-              toolUseId: tc.id,
-              name: tc.name,
-              reason: 'confirm required but non-interactive mode',
-            };
-            toolResults.push({
-              toolUseId: tc.id,
-              content: `[denied in non-interactive mode] ${decision.reason}`,
-              isError: true,
-            });
-            metrics.toolCalls.inc({ tool: tc.name, status: 'denied' });
-            continue;
-          }
-          // 必填字段缺失时直接 yield need_input，绕过 y/n 二次确认
+          // 必填字段缺失时先尝试 vault 自动注入；即使 non-interactive 也要
+          // 先给 vault 一次机会，否则 CI / pipe 模式下 vault 永远无法工作。
           if (decision.missingFields && decision.missingFields.length > 0) {
             // Phase 1 vault 集成：缺凭证时先尝试 vault 拿 connectionId
             const vaultResult = await evaluateVaultCredentials(
@@ -535,6 +576,22 @@ export async function* run(
               decision.missingFields = [];
               decision.decision = 'allow';
               // 不走 confirmAction，落到执行
+            } else if (options.nonInteractive) {
+              // 非交互模式无法追问：明确拒绝并给出可操作原因，
+              // 而不是静默跳过 vault 直接 deny。
+              yield {
+                type: 'tool_denied',
+                toolUseId: tc.id,
+                name: tc.name,
+                reason: `missing required field(s) in non-interactive mode (vault: ${vaultResult.reason})`,
+              };
+              toolResults.push({
+                toolUseId: tc.id,
+                content: `[denied in non-interactive mode] missing ${decision.missingFields.join(', ')}; vault: ${vaultResult.reason}`,
+                isError: true,
+              });
+              metrics.toolCalls.inc({ tool: tc.name, status: 'denied' });
+              continue;
             } else {
               // vault 走不通：根据 reason 给出不同提示
               let prompt = `请提供 ${decision.missingFields.join(', ')}`;
@@ -565,6 +622,22 @@ export async function* run(
               metrics.toolCalls.inc({ tool: tc.name, status: 'need_input' });
               continue;
             }
+          }
+          // 命令级 confirm（rm -rf / systemctl stop 等）在非交互模式仍拒绝
+          if (decision.decision === 'confirm' && options.nonInteractive) {
+            yield {
+              type: 'tool_denied',
+              toolUseId: tc.id,
+              name: tc.name,
+              reason: 'confirm required but non-interactive mode',
+            };
+            toolResults.push({
+              toolUseId: tc.id,
+              content: `[denied in non-interactive mode] ${decision.reason}`,
+              isError: true,
+            });
+            metrics.toolCalls.inc({ tool: tc.name, status: 'denied' });
+            continue;
           }
           if (decision.decision === 'confirm') {
             const ok = await confirmAction(
@@ -659,14 +732,11 @@ export async function* run(
           }
         }
 
-        // 反幻觉守卫：检测失败信号
-        const failure = isFailureSignal(
-          tc.name,
-          tc.id,
-          !!result.isError,
-          result.content,
-          failureKeywords
-        );
+        // 反幻觉守卫：检测失败信号（config 开关此前被忽略）
+        const guardEnabled = cfg.hallucinationGuard?.enabled !== false;
+        const failure = guardEnabled
+          ? isFailureSignal(tc.name, tc.id, !!result.isError, result.content, failureKeywords)
+          : { isError: false, toolName: tc.name, toolUseId: tc.id };
         if (failure.isError && !encounteredFailure) {
           encounteredFailure = true;
           firstFailureToolId = tc.id;
@@ -681,7 +751,10 @@ export async function* run(
           });
         }
 
-        // 二次填充审计日志（exit_code / stdout 摘要）
+        // 二次填充审计日志（真实 exit_code / 真实结果摘要）
+        const resultData = result.data as { exitCode?: unknown } | undefined;
+        const exitCode =
+          typeof resultData?.exitCode === 'number' ? resultData.exitCode : undefined;
         auditWrite({
           session_id: sessionId,
           trace_id: traceId,
@@ -689,8 +762,8 @@ export async function* run(
           command: typeof tc.input.command === 'string' ? tc.input.command : undefined,
           host: typeof tc.input.host === 'string' ? tc.input.host : undefined,
           decision: 'allow',
-          reason: 'executed',
-          exit_code: 0,
+          reason: result.isError ? 'tool_error' : 'executed',
+          exit_code: exitCode,
           stdout_summary: result.content.slice(0, 256),
         });
       }
@@ -702,8 +775,9 @@ export async function* run(
         content: r.content,
         isError: r.isError,
       }));
-      // 反幻觉：若本轮任一工具失败，把失败上下文追加到 user 消息
-      if (encounteredFailure && firstFailureToolId) {
+      // 反幻觉提示必须放在 tool_result 之后（同一 user 消息），
+      // 不能插在 tool_use / tool_result 之间破坏协议顺序。
+      if ((encounteredFailure && firstFailureToolId) || guardHintNeeded) {
         resultBlocks.push({
           type: 'text',
           text: HALLUCINATION_GUARD_HINT,
@@ -796,11 +870,56 @@ export async function loadHistory(sessionId: string): Promise<Message[]> {
   const session = Session.open(sessionId);
   const events = session.load();
   const messages: Message[] = [];
+  // 同一轮的多个 tool_result 必须合并到一条 user 消息里；拆成多条
+  // 连续 user 消息会破坏 provider 的 tool_use/tool_result 配对语义。
+  let pendingResults: ContentBlock[] = [];
+  let pendingToolUses = new Set<string>();
+  const flushResults = () => {
+    if (pendingResults.length === 0) return;
+    messages.push({ role: 'user', content: pendingResults });
+    pendingResults = [];
+  };
+  // 崩溃/中断可能让 WAL 只留下部分 tool_result。缺的结果必须补成
+  // tool_result，否则 provider 会拒绝“有 tool_use 但没有对应结果”的历史。
+  const fillMissingResults = () => {
+    for (const id of pendingToolUses) {
+      pendingResults.push({
+        type: 'tool_result',
+        toolUseId: id,
+        content: '[no tool result recorded; the run was interrupted or the result was lost]',
+        isError: true,
+      });
+    }
+    pendingToolUses.clear();
+  };
+  const flushTurn = () => {
+    fillMissingResults();
+    flushResults();
+  };
+
   for (const e of events) {
+    if (e.type === 'tool_result') {
+      const d = e.data as { id: string; content: string; isError: boolean };
+      pendingResults.push({
+        type: 'tool_result',
+        toolUseId: d.id,
+        content: d.content,
+        isError: d.isError,
+      });
+      pendingToolUses.delete(d.id);
+      continue;
+    }
+
+    // tool_call / compression / system 事件不产生消息，也不能触发 flush：
+    // 一次工具链的 tool_call → tool_result 会交替出现，按事件 flush 会把
+    // 并行工具的结果拆成多条 user 消息。
+    if (e.type !== 'user_message' && e.type !== 'assistant_message') continue;
+
+    flushTurn();
     if (e.type === 'user_message') {
       const d = e.data as { text: string };
       messages.push({ role: 'user', content: d.text });
-    } else if (e.type === 'assistant_message') {
+    } else {
       const d = e.data as {
         text: string;
         tool_uses: { id: string; name: string; input: Record<string, unknown> }[];
@@ -808,18 +927,15 @@ export async function loadHistory(sessionId: string): Promise<Message[]> {
       };
       const blocks: ContentBlock[] = [];
       if (d.text) blocks.push({ type: 'text', text: d.text });
-      for (const tu of d.tool_uses ?? []) {
+      const toolUses = d.tool_uses ?? [];
+      for (const tu of toolUses) {
         blocks.push({ type: 'tool_use', id: tu.id, name: tu.name, input: tu.input });
       }
       messages.push({ role: 'assistant', content: blocks });
-    } else if (e.type === 'tool_result') {
-      const d = e.data as { id: string; content: string; isError: boolean };
-      messages.push({
-        role: 'user',
-        content: [{ type: 'tool_result', toolUseId: d.id, content: d.content, isError: d.isError }],
-      });
+      pendingToolUses = new Set(toolUses.map((tu) => tu.id));
     }
   }
+  flushTurn();
   return messages;
 }
 
